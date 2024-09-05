@@ -1,0 +1,16 @@
+{
+  "configurations": [
+    {
+      "name": "Deploy Cloud Function",
+      "type": "cloudcode.cloudfunctions",
+      "request": "launch",
+      "functionName": "GenerateDescriptions",
+      "region": "europe-central2",
+      "gen": "GEN_2",
+      "revision": "generatedescriptions-00001-zol",
+      "entryPoint": "hello_http",
+      "runtime": "python312",
+      "testInput": ""
+    }
+  ]
+}
