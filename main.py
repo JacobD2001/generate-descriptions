@@ -15,55 +15,102 @@ load_dotenv()
 # Retrieve the OpenAI API key from the .env file
 openai_api_key = os.getenv('OPENAI_API_KEY')
 
+
 # Function to scrape the website using Playwright and BeautifulSoup
 def scrape_website(url: str) -> str:
     with sync_playwright() as p:
-        # Launch a headless browser
+        # Launch a headless browser (since we are in the cloud, use headless=True)
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
-        # Visit the website
+        # Visit the main website (homepage)
+        print(f"Visiting main URL: {url}")
         page.goto(url)
-
-        # Extract page content
         html_content = page.content()
+
+        # Parse the homepage content using BeautifulSoup
+        soup = BeautifulSoup(html_content, 'lxml')
+
+        # Step 1: Find the navbar and collect all links from it
+        avoid_keywords = ['publications', 'downloads', 'catalogues', 'blog', 'download']  # Keywords to avoid
+        navbar_links = []
+        for nav in soup.find_all(['nav', 'ul', 'menu']):
+            for link in nav.find_all('a', href=True):
+                full_link = link['href']
+                
+                # Ensure the link is complete (relative links need to be completed with the base URL)
+                if full_link.startswith('/'):
+                    full_link = url.rstrip('/') + full_link
+                
+                # Skip links containing any avoid_keywords
+                if any(keyword in full_link.lower() for keyword in avoid_keywords):
+                    print(f"Skipping link due to keyword match: {full_link}")
+                    continue  # Skip this link if it contains any of the avoid keywords
+                
+                navbar_links.append(full_link)
+
+        # Remove duplicate links
+        navbar_links = list(set(navbar_links))
+        print(f"Found {len(navbar_links)} navbar links to scrape:")
+        
+        # Log the links to be scraped
+        for idx, link in enumerate(navbar_links, 1):
+            print(f"{idx}. {link}")
+
+        # Step 2: Scrape content from each navbar link, one level deep
+        relevant_content = []
+        for link in navbar_links:
+            try:
+                print(f"\nScraping URL: {link}")
+                page.goto(link)
+                subpage_content = page.content()
+
+                # Parse the subpage content using BeautifulSoup
+                sub_soup = BeautifulSoup(subpage_content, 'lxml')
+
+                # Collect relevant headings and text content from the subpage
+                headings = [heading.get_text(strip=True) for heading in sub_soup.find_all(['h1', 'h2', 'h3'])]
+                relevant_content.extend(headings)
+
+                # Collect text from main divs or sections
+                page_content = []
+                for section in sub_soup.find_all(['div', 'section']):
+                    # Exclude sections with irrelevant content by checking class or ID
+                    section_class_or_id = section.get('class', [])
+                    if isinstance(section.get('id'), str):
+                        section_class_or_id += [section.get('id')]
+
+                    # Skip sections with irrelevant keywords like blog, news, article, etc.
+                    if any(keyword in str(section_class_or_id).lower() for keyword in ['blog', 'news', 'article', 'newsletter', 'publications']):
+                        print(f"Skipping irrelevant section in URL: {link}")
+                        continue
+
+                    # Get the text from the section (if it's relevant)
+                    section_text = section.get_text(strip=True)
+                    if len(section_text.split()) > 30:  # Only consider sections with more than 30 words
+                        page_content.append(section_text)
+                        relevant_content.append(section_text)
+
+                # Log the scraped content
+                print(f"\nScraped {len(headings)} headings and collected content from {link}.")
+                if page_content:
+                    print(f"Content scraped from {link}:\n" + "\n".join(page_content))
+                else:
+                    print(f"No significant content found on {link}.")
+
+            except Exception as e:
+                print(f"Error scraping {link}: {str(e)}")
+                continue
 
         # Close the browser
         browser.close()
 
-        # Parse the page content using BeautifulSoup
-        soup = BeautifulSoup(html_content, 'lxml')
-
-        # Define a set of keywords or tags to exclude from scraping (e.g., blogs, newsletters, articles)
-        exclude_keywords = ['blog', 'news', 'article', 'newsletter']
-
-        # Step 1: Collect the main headings and text content from the page
-        relevant_content = []
-
-        # Get headings (h1, h2, h3) to understand the high-level structure
-        for heading in soup.find_all(['h1', 'h2', 'h3']):
-            relevant_content.append(heading.get_text(strip=True))
-
-        # Step 2: Collect text from main divs, skipping blogs or irrelevant sections
-        for div in soup.find_all('div'):
-            # Ensure class and id are handled as lists
-            div_class_or_id = div.get('class', [])
-            if isinstance(div.get('id'), str):
-                div_class_or_id += [div.get('id')]
-
-            # Skip divs that have irrelevant classes or IDs
-            if any(keyword in str(div_class_or_id).lower() for keyword in exclude_keywords):
-                continue  # Skip if the div is likely part of a blog or irrelevant section
-
-            # Get the text inside the div (limit depth, avoid deep product details)
-            relevant_text = div.get_text(strip=True)
-            if len(relevant_text.split()) > 30:  # Consider divs with more than 30 words as relevant sections
-                relevant_content.append(relevant_text)
-
         # Join all the relevant content into a single string
         scraped_data = " ".join(relevant_content)
+        print("\nFinished scraping all links.")
 
         return scraped_data
+
 
 
 # Function to generate a company description using LangChain's OpenAI ChatGPT
@@ -132,7 +179,7 @@ def hello_http(request):
         return {
             'row': row,
             'verification_status': verification_status,
-            'scraped_data': scraped_data[:1000],  # Truncate long data for brevity
+            'scraped_data': scraped_data,  # Truncate long data for brevity
             'description': description
         }, 200
     else:
