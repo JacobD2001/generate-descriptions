@@ -1,165 +1,119 @@
-import sys
-from contextlib import redirect_stdout
-from playwright.sync_api import sync_playwright
+import os
+import json
+import asyncio
+import logging
+from dotenv import load_dotenv
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
+from langchain.prompts.prompt import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_openai import RunnableSequence
 
-def filter_relevant_sections(text: str) -> bool:
-    """
-    Filter out irrelevant sections based on keywords. This function can be 
-    enhanced to look for specific patterns, keywords, or section sizes.
-    """
-    # Keywords indicating relevant sections
-    relevant_keywords = ['about', 'company', 'mission', 'vision', 'team', 'history', 'overview', 'services', 'contact']
-    
-    # Keywords indicating irrelevant sections
-    irrelevant_keywords = ['blog', 'news', 'article', 'download', 'catalogue', 'publications']
-    
-    # Return True if any relevant keyword is found and no irrelevant keywords exist
-    if any(keyword in text.lower() for keyword in relevant_keywords):
-        return True
-    if any(keyword in text.lower() for keyword in irrelevant_keywords):
-        return False
-    return False
+# Load environment variables
+load_dotenv()
 
-def remove_redundant_content(content_list: list) -> list:
-    """
-    Removes repetitive or overly similar content from the list.
-    """
-    seen = set()
-    reduced_content = []
-    for content in content_list:
-        # Check if content is new (not seen before)
-        if content not in seen and len(content.split()) > 5:  # Only keep meaningful content
-            reduced_content.append(content)
-            seen.add(content)  # Mark content as seen
-    return reduced_content
+# Configure logging
+logging.basicConfig(filename='scraper_debug.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def limit_word_count(content: str, max_words: int = 500) -> str:
-    """
-    Truncate content to a maximum number of words to avoid sending too much data.
-    """
-    words = content.split()
-    if len(words) > max_words:
-        return " ".join(words[:max_words]) + "..."
-    return content
+# Function to initialize OpenAI API
+def initialize_openai():
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        logging.error("OpenAI API key is not set in the environment variables.")
+        raise ValueError("OpenAI API key is not set.")
+    return ChatOpenAI(api_key=openai_api_key, temperature=0, model_name="gpt-4o-mini")
 
-def scrape_website(url: str, log_file: str = "debug_log.txt", max_words: int = 500) -> str:
-    with open(log_file, 'w', encoding='utf-8') as f:
-        # Redirect all prints to the specified log file
-        with redirect_stdout(f):
-            with sync_playwright() as p:
-                # Launch a headless browser
-                browser = p.chromium.launch(headless=False)  # Set headless=False for debugging
-                page = browser.new_page()
+# Function to get all links from a webpage
+async def get_all_links(page, url):
+    await page.goto(url)
+    content = await page.content()
+    soup = BeautifulSoup(content, 'html.parser')
+    links = set(a.get('href') for a in soup.find_all('a', href=True))
+    logging.info(f"Found links: {links}")
+    return links
 
-                # Visit the main website (homepage)
-                print(f"Visiting main URL: {url}")
-                page.goto(url)
-                html_content = page.content()
+# Function to call OpenAI API and get relevant links
+async def get_relevant_links(openai_chain, urls):
+    logging.info(f"Calling OpenAI API with URLs: {urls}")
+    prompt = PromptTemplate(
+        input_variables=["urls"],
+        template=(
+                "Given the following URLs, please determine if each one is relevant for scraping data to generate a company description. "
+                "Mark each URL with 'YES' or 'NO'. Provide the result in JSON format with URLs as keys and 'YES' or 'NO' as values.\n\n"
+                "URLs:\n{urls}\n\n"
+                "Response format:\n"
+                "{\n"
+                "    'https://example.com/about': 'YES',\n"
+                "    'https://example.com/contact': 'NO',\n"
+                "    'https://example.com/products': 'YES'\n"
+                "}\n\n"
+                "Please format your response as shown above."
+            )   
+    )
+    chain = prompt | openai_chain #TODO: here check the structure of answer maybe pydantic use
+    response = await chain.invoke({"urls": urls})
+    relevant_links = json.loads(response)
+    logging.info(f"OpenAI response: {relevant_links}")
+    return relevant_links
 
-                # Parse the homepage content using BeautifulSoup
-                soup = BeautifulSoup(html_content, 'lxml')
+# Function to scrape data from relevant URLs
+async def scrape_data_from_urls(page, relevant_urls):
+    data = {}
+    for url in relevant_urls:
+        logging.info(f"Scraping data from URL: {url}")
+        await page.goto(url)
+        content = await page.content()
+        soup = BeautifulSoup(content, 'html.parser')
+        data[url] = soup.get_text()
+    logging.info(f"Scraped data: {data}")
+    return data
 
-                # Step 1: Find the navbar and collect all links from it
-                avoid_keywords = ['publications', 'downloads', 'catalogues', 'blog', 'download']  # Keywords to avoid
-                navbar_links = []
-                for nav in soup.find_all(['nav', 'ul', 'menu']):
-                    for link in nav.find_all('a', href=True):
-                        full_link = link['href']
-                        
-                        # Ensure the link is complete (relative links need to be completed with the base URL)
-                        if full_link.startswith('/'):
-                            full_link = url.rstrip('/') + full_link
-                        
-                        # Skip links containing any avoid_keywords
-                        if any(keyword in full_link.lower() for keyword in avoid_keywords):
-                            print(f"Skipping link due to keyword match: {full_link}")
-                            continue  # Skip this link if it contains any of the avoid keywords
-                        
-                        navbar_links.append(full_link)
+# Function to call OpenAI API to generate a description
+async def generate_description(openai_chain, scraped_data):
+    logging.info(f"Calling OpenAI API to generate description with data: {scraped_data}")
+    prompt = PromptTemplate(
+        input_variables=["data"],
+        template="Generate a company description based on the following data. If the data is insufficient, return a list of URLs to scrape more information. Data: {data}"
+    )
+    chain = prompt | openai_chain
+    response = await chain.invoke({"data": json.dumps(scraped_data)})
+    description = json.loads(response)
+    logging.info(f"OpenAI response: {description}")
+    return description
 
-                # Remove duplicate links
-                navbar_links = list(set(navbar_links))
-                print(f"Found {len(navbar_links)} navbar links to scrape:")
-                
-                # Log the links to be scraped
-                for idx, link in enumerate(navbar_links, 1):
-                    print(f"{idx}. {link}")
+# Main function
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
 
-                # Step 2: Scrape content from each navbar link, one level deep
-                relevant_content = []
-                for link in navbar_links:
-                    try:
-                        print(f"\nScraping URL: {link}")
-                        page.goto(link)
-                        subpage_content = page.content()
+        # Example main link
+        main_url = "https://centrum1.pl/"
+        logging.info(f"Starting scraping process for main URL: {main_url}")
 
-                        # Parse the subpage content using BeautifulSoup
-                        sub_soup = BeautifulSoup(subpage_content, 'lxml')
+        # Initialize OpenAI API
+        openai = initialize_openai()
 
-                        # Collect relevant headings and text content from the subpage
-                        headings = [heading.get_text(strip=True) for heading in sub_soup.find_all(['h1', 'h2', 'h3'])]
-                        relevant_content.extend(headings)
+        # Step 2: Get all links from the main page
+        all_links = await get_all_links(page, main_url)
 
-                        # Collect text from main divs or sections
-                        page_content = []
-                        for section in sub_soup.find_all(['div', 'section']):
-                            # Exclude sections with irrelevant content by checking class or ID
-                            section_class_or_id = section.get('class', [])
-                            if isinstance(section.get('id'), str):
-                                section_class_or_id += [section.get('id')]
+        # Step 3: Get relevant links
+        relevant_links = await get_relevant_links(openai, list(all_links))
 
-                            # Skip sections with irrelevant keywords like blog, news, article, etc.
-                            if any(keyword in str(section_class_or_id).lower() for keyword in ['blog', 'news', 'article', 'newsletter', 'publications']):
-                                print(f"Skipping irrelevant section in URL: {link}")
-                                continue
+        # Filter URLs
+        relevant_urls = [url for url, mark in relevant_links.items() if mark == 'YES']
+        logging.info(f"Relevant URLs to scrape: {relevant_urls}")
 
-                            # Get the text from the section (if it's relevant and passes the filtering)
-                            section_text = section.get_text(strip=True)
-                            if len(section_text.split()) > 30 and filter_relevant_sections(section_text):
-                                page_content.append(section_text)
-                                relevant_content.append(section_text)
+        # Step 4: Scrape data from relevant URLs
+        scraped_data = await scrape_data_from_urls(page, relevant_urls)
 
-                        # Log the scraped content
-                        print(f"\nScraped {len(headings)} headings and collected content from {link}.")
-                        if page_content:
-                            print(f"Content scraped from {link}:\n" + "\n".join(page_content))
-                        else:
-                            print(f"No significant content found on {link}.")
+        # Step 5 & 6: Generate description
+        description = await generate_description(openai, scraped_data)
 
-                    except Exception as e:
-                        print(f"Error scraping {link}: {str(e)}")
-                        continue
+        # Step 7: Print final description
+        print(f"Final company description: {description}")
 
-                # Close the browser
-                browser.close()
-
-                # Step 3: Reduce redundant content
-                reduced_content = remove_redundant_content(relevant_content)
-
-                # Join all the relevant content into a single string
-                scraped_data = " ".join(reduced_content)
-                print("\nFinished scraping all links.")
-                
-                # Truncate content to a manageable size
-                truncated_scraped_data = limit_word_count(scraped_data, max_words)
-                
-                # Log the final scraped data to the file
-                print("\nScraped Data:\n")
-                print(truncated_scraped_data)  # This will print the final scraped data into the log file for debugging.
-
-        return truncated_scraped_data
-
+        await browser.close()
 
 if __name__ == "__main__":
-    # URL to scrape (replace this with the URL you want to scrape)
-    url_to_scrape = "https://www.spetech.com.pl/"
-    
-    # Optional: You can specify the log file where all prints will be saved for debugging
-    log_filename = "scraping_debug_log.txt"
-
-    # Call the scraping function
-    result = scrape_website(url_to_scrape, log_file=log_filename)
-
-    # Print the result (for demonstration purposes, this print will not be logged)
-    print("Scraping finished. Check the log file for detailed output.")
+    asyncio.run(main())
