@@ -7,7 +7,9 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from langchain.prompts.prompt import PromptTemplate
 from langchain_openai import ChatOpenAI
-from langchain_openai import RunnableSequence
+from urllib.parse import urljoin
+from urllib.parse import urljoin
+import re
 
 # Load environment variables
 load_dotenv()
@@ -28,9 +30,31 @@ async def get_all_links(page, url):
     await page.goto(url)
     content = await page.content()
     soup = BeautifulSoup(content, 'html.parser')
-    links = set(a.get('href') for a in soup.find_all('a', href=True))
-    logging.info(f"Found links: {links}")
-    return links
+    
+    # Create an empty set to store the full URLs
+    full_links = set()
+    
+    # Define patterns to exclude
+    exclude_patterns = [r'^tel:', r'^mailto:']
+    
+    # Extract all href attributes from <a> tags
+    for a in soup.find_all('a', href=True):
+        href = a.get('href')
+        
+        # Skip links that match exclude patterns
+        if any(re.match(pattern, href) for pattern in exclude_patterns):
+            continue
+        
+        # Join the base URL with the href to create the full URL
+        full_url = urljoin(url, href)
+        
+        # Add the full URL to the set
+        full_links.add(full_url)
+    
+    logging.info(f"Filtered links: {full_links}")
+    return full_links
+
+
 
 # Function to call OpenAI API and get relevant links
 async def get_relevant_links(openai_chain, urls):
@@ -88,7 +112,7 @@ async def main():
         page = await browser.new_page()
 
         # Example main link
-        main_url = "https://centrum1.pl/"
+        main_url = "https://www.spetech.com.pl/"
         logging.info(f"Starting scraping process for main URL: {main_url}")
 
         # Initialize OpenAI API
@@ -96,6 +120,9 @@ async def main():
 
         # Step 2: Get all links from the main page
         all_links = await get_all_links(page, main_url)
+
+        # Now all_links will contain full URLs
+        logging.info(f"Full links: {all_links}")
 
         # Step 3: Get relevant links
         relevant_links = await get_relevant_links(openai, list(all_links))
