@@ -1,190 +1,260 @@
+#TODO: Debug this function, code in debug works well.
+#TODO: Add the regon verification
+#TODO: Sync with google sheets and add the output to the sheet
+#TODO: Test it.
+
 from dotenv import load_dotenv
-import os
-from typing import Tuple
+from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
 from langchain.prompts.prompt import PromptTemplate
 from langchain_openai import ChatOpenAI
-from langchain.chains import LLMChain
-from langchain.schema import HumanMessage
+from urllib.parse import urljoin
+from urllib.parse import urljoin
+import re
+from output_parsers import relevant_links_parser
+import unicodedata
 import functions_framework
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+import requests
+
 
 # Load the environment variables from .env
 load_dotenv()
-
-# Retrieve the OpenAI API key from the .env file
-openai_api_key = os.getenv('OPENAI_API_KEY')
-
-
-# Function to scrape the website using Playwright and BeautifulSoup
-def scrape_website(url: str) -> str:
-    with sync_playwright() as p:
-        # Launch a headless browser (since we are in the cloud, use headless=True)
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        # Visit the main website (homepage)
-        print(f"Visiting main URL: {url}")
-        page.goto(url)
-        html_content = page.content()
-
-        # Parse the homepage content using BeautifulSoup
-        soup = BeautifulSoup(html_content, 'lxml')
-
-        # Step 1: Find the navbar and collect all links from it
-        avoid_keywords = ['publications', 'downloads', 'catalogues', 'blog', 'download']  # Keywords to avoid
-        navbar_links = []
-        for nav in soup.find_all(['nav', 'ul', 'menu']):
-            for link in nav.find_all('a', href=True):
-                full_link = link['href']
-                
-                # Ensure the link is complete (relative links need to be completed with the base URL)
-                if full_link.startswith('/'):
-                    full_link = url.rstrip('/') + full_link
-                
-                # Skip links containing any avoid_keywords
-                if any(keyword in full_link.lower() for keyword in avoid_keywords):
-                    print(f"Skipping link due to keyword match: {full_link}")
-                    continue  # Skip this link if it contains any of the avoid keywords
-                
-                navbar_links.append(full_link)
-
-        # Remove duplicate links
-        navbar_links = list(set(navbar_links))
-        print(f"Found {len(navbar_links)} navbar links to scrape:")
-        
-        # Log the links to be scraped
-        for idx, link in enumerate(navbar_links, 1):
-            print(f"{idx}. {link}")
-
-        # Step 2: Scrape content from each navbar link, one level deep
-        relevant_content = []
-        for link in navbar_links:
-            try:
-                print(f"\nScraping URL: {link}")
-                page.goto(link)
-                subpage_content = page.content()
-
-                # Parse the subpage content using BeautifulSoup
-                sub_soup = BeautifulSoup(subpage_content, 'lxml')
-
-                # Collect relevant headings and text content from the subpage
-                headings = [heading.get_text(strip=True) for heading in sub_soup.find_all(['h1', 'h2', 'h3'])]
-                relevant_content.extend(headings)
-
-                # Collect text from main divs or sections
-                page_content = []
-                for section in sub_soup.find_all(['div', 'section']):
-                    # Exclude sections with irrelevant content by checking class or ID
-                    section_class_or_id = section.get('class', [])
-                    if isinstance(section.get('id'), str):
-                        section_class_or_id += [section.get('id')]
-
-                    # Skip sections with irrelevant keywords like blog, news, article, etc.
-                    if any(keyword in str(section_class_or_id).lower() for keyword in ['blog', 'news', 'article', 'newsletter', 'publications']):
-                        print(f"Skipping irrelevant section in URL: {link}")
-                        continue
-
-                    # Get the text from the section (if it's relevant)
-                    section_text = section.get_text(strip=True)
-                    if len(section_text.split()) > 30:  # Only consider sections with more than 30 words
-                        page_content.append(section_text)
-                        relevant_content.append(section_text)
-
-                # Log the scraped content
-                print(f"\nScraped {len(headings)} headings and collected content from {link}.")
-                if page_content:
-                    print(f"Content scraped from {link}:\n" + "\n".join(page_content))
-                else:
-                    print(f"No significant content found on {link}.")
-
-            except Exception as e:
-                print(f"Error scraping {link}: {str(e)}")
-                continue
-
-        # Close the browser
-        browser.close()
-
-        # Join all the relevant content into a single string
-        scraped_data = " ".join(relevant_content)
-        print("\nFinished scraping all links.")
-
-        return scraped_data
-
-
-
-# Function to generate a company description using LangChain's OpenAI ChatGPT
-def generate_company_description(scraped_data: str) -> str:
-    # Create a prompt template for company description generation
-    description_template = """
-    Based on the following scraped information from a company's website: {scraped_info},
-    please generate:
-    1. A concise company description that includes their products and services.
-    2. Key details about the company, such as their industry and main focus.
-
-    Use the provided information and format it clearly.
-    """
-
-    # Prepare the prompt template with the scraped information
-    description_prompt_template = PromptTemplate(
-        input_variables=["scraped_info"],
-        template=description_template,
-    )
-
-    # Create the OpenAI Chat Model (using GPT-4 or GPT-3.5-turbo)
-    llm = ChatOpenAI(temperature=0, model_name="gpt-4o-mini", openai_api_key=openai_api_key)
-
-    # Create the LLMChain with the prompt and the model
-    chain = LLMChain(
-        llm=llm,
-        prompt=description_prompt_template
-    )
-
-    # Invoke the chain to generate the description
-    response = chain.run(scraped_info=scraped_data)
-
-    return response
 
 
 @functions_framework.http
 def hello_http(request):
     """HTTP Cloud Function to scrape a website, verify REGON, and generate a description."""
-    # Parse the JSON payload from the request
+        # Parse the JSON payload from the request
     request_json = request.get_json(silent=True)
 
     if request_json:
-        # Extract 'row', 'strona_www', and 'regon' from the payload
         row = request_json.get('row', 'No row provided')
         strona_www = request_json.get('strona_www', 'No URL provided')
         regon = request_json.get('regon', 'No REGON provided')
 
-        # Log the received values (for testing and debugging)
-        print(f"Received data - Row: {row}, Strona WWW: {strona_www}, REGON: {regon}")
+        def process_request():
+            # Get all links from the main page
+            all_links = get_all_links(strona_www)
 
-        # Scrape the website
-        scraped_data = scrape_website(strona_www)
-        print(f"Scraped Data: {scraped_data}")
+            # Get relevant links using OpenAI
+            relevant_links = get_relevant_links(list(all_links))
 
-        # Verify if the REGON is present in the scraped data
-        if regon in scraped_data:
-            verification_status = "Zweryfikowano"
-        else:
-            verification_status = "Potrzebna weryfikacja"
+            # Filter URLs marked as 'YES'
+            yes_urls = filter_relevant_links(relevant_links)
 
-        # Step 5: Generate the description using GPT based on the scraped data
-        description = generate_company_description(scraped_data)
-        print(f"Generated Description: {description}")
+            # Scrape data from relevant URLs
+            scraped_data = scrape_data_from_urls(yes_urls)
 
-        # Return the verification status and generated description (will update Google Sheet later)
-        return {
-            'row': row,
-            'verification_status': verification_status,
-            'scraped_data': scraped_data,  # Truncate long data for brevity
-            'description': description
-        }, 200
-    else:
-        return "Invalid request", 400
+            # Clean scraped data
+            cleaned_data = clean_and_format_scraped_data(scraped_data)
 
+            # Generate description
+            description = generate_description(cleaned_data)
 
-if __name__ == "__main__":
-    load_dotenv()
+            return {
+                "description": description
+            }
+
+        return process_request()
+
+# Helper functions
+
+def get_all_links(url):
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    full_links = set()
+    phone_pattern = re.compile(r'^[\+\d\-\(\)\s]+$')
+    email_pattern = re.compile(r'.+@.+\..+')
+    keyword_pattern = re.compile(r'blog|publications', re.IGNORECASE)
+
+    for a in soup.find_all('a', href=True):
+        href = a.get('href').strip()
+        if (
+            href.startswith('mailto:') or
+            href.startswith('tel:') or
+            phone_pattern.match(href) or
+            (email_pattern.match(href) and not href.startswith('mailto:')) or
+            keyword_pattern.search(href)
+        ):
+            continue
+
+        full_url = urljoin(url, href)
+        full_links.add(full_url)
+
+    return full_links
+
+def get_relevant_links(urls):
+
+    get_relevant_links_template = """
+    # Kontekst
+    Jeteś asystentem którego zadaniem jest jak najlepsze oznaczenie linków ze strony firmy pod kątem istotności znajdujących się informacji pod tymi linkami w kontekście stworzenia opisu firmy.
+    # Zadanie
+    Na podstawie podanych linków, oznacz te, pod którymi, z największym prawdopodobieństwem znajdują się istotne informacje do stworzenia opisu firmy.
+    Aby lepiej oznaczyć linki przeanalizuj kryteria opisu firmy, które będą używanie do stworzenia takiego opisu.
+    # Kryteria opisu
+    - Opis powinien być zwięzły, więc nie jest konieczne oznaczanie wszystkich linków, a jedynie te, które zawierają najważniejsze informacje.
+    - Opis powinien zawierać informacje o firmie, takie jak:
+        - Co firma oferuje, czy sprzedaje produkty, czy usługi, czy jest dystrybutorem?
+        - W jakiej branży działa firma?
+    # Podsumowanie
+    Głównie zwracaj uwagę na zakładki typu 'o nas', 'produkty, 'usługi', 'kontakt'
+    Unikaj oznaczania linków do blogów, artykułów, publikacji, itp.
+    Oznacz link 'YES' jeśli zawiera on informacje istotne, a 'NO' jeśli nie zawiera.
+    Oznaczone przez Ciebie linki będą programistycznie scrapowane, a ich zawartość będzie użyta do stworzenia opisu firmy. Dlatego ważne jest abyś zawsze oznaczał linki zgodnie z kryteriami, i wielkością liter 'YES' lub 'NO'.
+    Linki: {urls}
+    # Odpowiedź
+    W odpowiedzi nie pomijaj żadnego linku. 
+    Liczba linków i linki powinny zgadzać się z podanymi. Dodaj jedynie oznaczenia 'YES' lub 'NO' dla każdego linku.
+    Maksymalnie oznacz 3 najistotniejsze linki, ponieważ są one scrapowane i naszym celem jest uniknięcie zbyt dużej ilości niepotrzebnych informacji.
+    NIE możesz oznaczyć więcej niż 3 linki jako 'YES'. Wybierz naistotniejsze pod względem kryteriów.
+    Nie dodawaj żadnych dodatkowych informacji, podaj JEDYNIE listę linków.
+    Teraz przeanalizuj podane informacje i oznacz linki jako 'YES' lub 'NO'.
+    \n{format_instructions}
+    """
+    
+    get_relevant_links_prompt_template = PromptTemplate(
+        input_variables=["urls"],
+        template=get_relevant_links_template,
+        partial_variables={
+            "format_instructions": relevant_links_parser.get_format_instructions()
+        },
+    )
+    
+    # create the llm
+    llm = ChatOpenAI(temperature=0, model_name="gpt-4o-mini")
+
+    # Combine the prompt and the LLM chain
+    chain = get_relevant_links_prompt_template | llm | relevant_links_parser
+
+    res = chain.invoke(input={"urls": urls})
+
+    return res
+
+# Function to filter relevant links
+def filter_relevant_links(links_output):
+    # Access the 'links' dictionary within the RelevantLinksOutput object
+    links_dict = links_output.links
+    
+    # Filter links that are marked as 'YES'
+    relevant_links = {url for url, relevance in links_dict.items() if relevance == 'YES'}
+    
+    return relevant_links
+
+# Function to scrape data from urls
+def scrape_data_from_urls(yes_urls):
+    data = {}
+    for url in yes_urls:
+        response = requests.get(url)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        data[url] = soup.get_text()
+    return data
+
+# TODO: Adjust cleaning for nip and regon
+def clean_and_format_scraped_data(scraped_data):
+    cleaned_data = {}
+    nip_pattern = r'\bNIP\s*\d{3}[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}\b'
+    regon_pattern = r'\bREGON\s*\d{9}\b'
+
+    noisy_patterns = [
+        r'\s+', 
+        r'\b(Polityka prywatności|Zastrzeżenia|Wszelkie prawa zastrzeżone|Cookies)\b',
+        r'(?:facebook|twitter|linkedin|instagram)\.com'
+    ]
+
+    repeated_block_patterns = [
+        r'(\+?\d[\d\s\-\(\)]{7,})',
+        r'\S+@\S+',
+    ]
+
+    for url, content in scraped_data.items():
+        content = unicodedata.normalize("NFKD", content)
+        content = re.sub(r'\s+', ' ', content).strip()
+
+        nip_match = re.search(nip_pattern, content)
+        regon_match = re.search(regon_pattern, content)
+        nip = nip_match.group(0) if nip_match else ""
+        regon = regon_match.group(0) if regon_match else ""
+
+        for pattern in repeated_block_patterns:
+            content = re.sub(pattern, '', content)
+        for pattern in noisy_patterns:
+            content = re.sub(pattern, '', content)
+
+        lines = content.split('. ')
+        seen = set()
+        deduplicated_lines = []
+
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                deduplicated_lines.append(line)
+
+        content = '. '.join(deduplicated_lines)
+        content = re.sub(r'\n{2,}', '\n', content)
+
+        if nip:
+            content += f"\nNIP: {nip}"
+        if regon:
+            content += f"\nREGON: {regon}"
+
+        if content:
+            cleaned_data[url] = content
+
+    formatted_data = ""
+    for url, content in cleaned_data.items():
+        formatted_data += f"Source: {url}\nContent:\n{content}\n\n"
+
+    return formatted_data
+
+# Function to generate description
+def generate_description(cleaned_data):
+
+    generate_description_template = """
+    # Kontekst
+    Jesteś asystentem którego zadaniem jest generowanie opisu firmy na podstawie danych zebranych ze stron internetowych.
+    Otrzymasz dane zescrapowane ze stron internetowych, na podstawie których powinieneś stworzyć opis firmy.
+    Dane te zawierają informacje o firmie, jej produktach, usługach, branży, itp.
+    Mogą to być dane w różnych językach jednak twoim zadaniem jest zawsze stworzenie opisu w języku Polskim.
+    # Zadanie
+    Stwórz opis firmy na podstawie podanych danych. Zgodnie z podanymi poniżej kryteriami.
+    # Kryteria opisu
+    - Opis powinien być zwięzły, ale zawierać wszystkie informacje o firmie określone w kryteriach opisu.
+    - Opis powinien być w pełni oparty na podstawie podanych danych. Nie dodawaj własnych informacji. Jeśli jakiś informacji nie ma w podanych danych, nie podawaj ich w opisie.
+    - Opis powinien być w języku Polskim.
+    - Opis powinien być podzielony na dwie sekcje i zawierać informacje takie jak:
+    SEKCJA 1: Profil funkcjonalny firmy
+        - Co firma jest producentem, dystrybutorem czy usługodawcą.
+        - Zwracaj uwagę czy wskazana spółka posiada jakieś unikalne aktywa, jeżeli będą takie informacje na jej stronie internetowej, np. jest właścicielem znaków towarowych, patentów, unikalnych linii produkcyjnych itp.
+        - Zwracaj uwagę czy firma prezentuje informacje o kanałach dystrybucji jakie stosuje albo jakiego rodzaju klientów obsługuje i w jakiej formule.
+        - Zwracaj uwagę jak kompleksowy jest jej profil funkcjonalny np. czy jest producentem kontraktowym, który wytwarza produkty według receptur i pod brandem zleceniodawców, czy też ma swoje własne receptury, własne brandy i samodzielnie sprzedaje produkty poprzez własne sklepy stacjonarne.
+        - Uwzględnij również informację czy nie jest podmiotem działającym w ramach grupy kapitałowej i czy nie ma podmiotów powiązanych, jeżeli informacje na jej stronie internetowej będą na to wskazywać.
+    SEKCJA 2: Oferta produktowa/usługowa
+        - Przedstaw pełną listę produktów / usług oferowanych przez spółkę.
+
+    Opis powinienen być szczegółowy, wyczerpujący i zawierać wszystkie informacje,
+    które uda się odnaleźć w podanych poniżej danych. Pomijaj w opisach informacje
+    dotyczące historii działalności spółki, kto ją założył, doświadczenia spółki, uzyskanych
+    nagród, cen produktów, dokładnej charakterystyki, składu czy zastosowania
+    produktów.
+    # Dane
+    Dane: {cleaned_data}
+    # Odpowiedź
+    W odpowiedzi nie używaj zwrotów typu, "oto odpowiedź", tylko odrazu podawaj opis. Nie dodawaj żadnych dodatkowych informacji, podaj JEDYNIE opis firmy zgodny z kryteriami.
+    ## Przykładowy opis(SEKCJA 1 + SEKCJA 2)
+    Darco Sp. z o.o. to jedna z wiodących firm w Polsce w branży instalacyjnej, specjalizująca się w produkcji systemów wentylacyjnych, kominowych oraz dystrybucji gorącego powietrza. Firma została założona w 1992 roku i od tego czasu dynamicznie rozwija swoją ofertę, obejmującą nowoczesne rozwiązania do wentylacji i ogrzewania. Darco prowadzi także działalność badawczo-rozwojową, posiada własne laboratoria oraz oferuje usługi technicznego doradztwa i kooperacji produkcyjnej.
+    Oferta Darco obejmuje szeroką gamę produktów, w tym systemy wentylacyjne, nasady kominowe, systemy dystrybucji gorącego powietrza, rury kominowe oraz różnorodne akcesoria związane z instalacjami wentylacyjnymi i kominowymi. Firma specjalizuje się również w produkcji systemów hybrydowej wentylacji, które są stosowane w budynkach mieszkalnych i przemysłowych. Darco kładzie duży nacisk na jakość swoich produktów oraz ich innowacyjność, co pozwala na spełnienie najwyższych standardów rynkowych.
+    # Podsumowanie
+    Ten opis jest bardzo ważny dla firmy, ponieważ będzie on wykorzystany do stworzenia opisu firmy na stronie internetowej. Dlatego ważne jest, aby opis był zgodny z podanymi kryteriami i zawierał wszystkie informacje z podanych danych.
+    Jest on również bardzo ważny dla mojej kariery zawodowej, moje życie zależy od tego, czy będę w stanie stworzyć ten opis. Dlatego poświęć na to zadanie dużo uwagi i staraj się jak najlepiej spełnić podane kryteria.
+    """
+
+    generate_description_prompt_template = PromptTemplate(
+        input_variables=["cleaned_data"],
+        template=generate_description_template,
+    )
+    
+    llm = ChatOpenAI(temperature=0, model_name="gpt-4o-mini")
+    chain = generate_description_prompt_template | llm
+    res_descripion = chain.invoke(input={"cleaned_data": cleaned_data})
+    return res_descripion
